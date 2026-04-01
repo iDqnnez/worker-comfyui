@@ -55,6 +55,8 @@ if os.environ.get("WEBSOCKET_TRACE", "false").lower() == "true":
 
 # Host where ComfyUI is running
 COMFY_HOST = "127.0.0.1:8188"
+# Timeout for downloading input images from hosted URLs (e.g. signed S3 links)
+IMAGE_DOWNLOAD_TIMEOUT_S = int(os.environ.get("IMAGE_DOWNLOAD_TIMEOUT_S", "120"))
 # Enforce a clean state after each job is done
 # see https://docs.runpod.io/docs/handler-additional-controls#refresh-worker
 REFRESH_WORKER = os.environ.get("REFRESH_WORKER", "false").lower() == "true"
@@ -147,6 +149,33 @@ def _attempt_websocket_reconnect(ws_url, max_attempts, delay_s, initial_error):
     )
 
 
+def _is_allowed_image_url(url):
+    """True if url is a http(s) URL suitable for downloading an input image."""
+    if not isinstance(url, str) or not url.strip():
+        return False
+    parsed = urllib.parse.urlparse(url.strip())
+    return parsed.scheme in ("http", "https") and bool(parsed.netloc)
+
+
+def _mime_type_for_upload(filename, content_type_header):
+    """Pick a multipart MIME type from the response Content-Type or filename."""
+    if content_type_header:
+        ct = content_type_header.split(";", 1)[0].strip().lower()
+        if ct.startswith("image/"):
+            return ct
+    ext = os.path.splitext(filename)[1].lower()
+    return {
+        ".png": "image/png",
+        ".jpg": "image/jpeg",
+        ".jpeg": "image/jpeg",
+        ".webp": "image/webp",
+        ".gif": "image/gif",
+        ".bmp": "image/bmp",
+        ".tiff": "image/tiff",
+        ".tif": "image/tiff",
+    }.get(ext, "image/png")
+
+
 def validate_input(job_input):
     """
     Validates the input for the handler function.
@@ -178,12 +207,20 @@ def validate_input(job_input):
     images = job_input.get("images")
     if images is not None:
         if not isinstance(images, list) or not all(
-            "name" in image and "image" in image for image in images
+            isinstance(image, dict) and "name" in image and "image" in image
+            for image in images
         ):
             return (
                 None,
                 "'images' must be a list of objects with 'name' and 'image' keys",
             )
+        for image in images:
+            if not _is_allowed_image_url(image["image"]):
+                return (
+                    None,
+                    "'images'[].'image' must be an http(s) URL that returns image bytes "
+                    "(e.g. a signed object store link)",
+                )
 
     # Optional: API key for Comfy.org API Nodes, passed per-request
     comfy_org_api_key = job_input.get("comfy_org_api_key")
@@ -291,10 +328,11 @@ def check_server(url, retries=0, delay=50):
 
 def upload_images(images):
     """
-    Upload a list of base64 encoded images to the ComfyUI server using the /upload/image endpoint.
+    Download input images from hosted URLs and upload them to ComfyUI via /upload/image.
 
     Args:
-        images (list): A list of dictionaries, each containing the 'name' of the image and the 'image' as a base64 encoded string.
+        images (list): Each dict has 'name' (filename for the workflow) and 'image'
+            (http(s) URL, e.g. a presigned S3 URL).
 
     Returns:
         dict: A dictionary indicating success or error.
@@ -310,22 +348,22 @@ def upload_images(images):
     for image in images:
         try:
             name = image["name"]
-            image_data_uri = image["image"]  # Get the full string (might have prefix)
+            source_url = image["image"].strip()
 
-            # --- Strip Data URI prefix if present ---
-            if "," in image_data_uri:
-                # Find the comma and take everything after it
-                base64_data = image_data_uri.split(",", 1)[1]
-            else:
-                # Assume it's already pure base64
-                base64_data = image_data_uri
-            # --- End strip ---
-
-            blob = base64.b64decode(base64_data)  # Decode the cleaned data
+            download = requests.get(
+                source_url,
+                timeout=IMAGE_DOWNLOAD_TIMEOUT_S,
+                allow_redirects=True,
+            )
+            download.raise_for_status()
+            blob = download.content
+            mime = _mime_type_for_upload(
+                name, download.headers.get("Content-Type", "")
+            )
 
             # Prepare the form data
             files = {
-                "image": (name, BytesIO(blob), "image/png"),
+                "image": (name, BytesIO(blob), mime),
                 "overwrite": (None, "true"),
             }
 
@@ -338,16 +376,14 @@ def upload_images(images):
             responses.append(f"Successfully uploaded {name}")
             print(f"worker-comfyui - Successfully uploaded {name}")
 
-        except base64.binascii.Error as e:
-            error_msg = f"Error decoding base64 for {image.get('name', 'unknown')}: {e}"
-            print(f"worker-comfyui - {error_msg}")
-            upload_errors.append(error_msg)
         except requests.Timeout:
-            error_msg = f"Timeout uploading {image.get('name', 'unknown')}"
+            error_msg = f"Timeout downloading or uploading {image.get('name', 'unknown')}"
             print(f"worker-comfyui - {error_msg}")
             upload_errors.append(error_msg)
         except requests.RequestException as e:
-            error_msg = f"Error uploading {image.get('name', 'unknown')}: {e}"
+            error_msg = (
+                f"Error fetching or uploading {image.get('name', 'unknown')}: {e}"
+            )
             print(f"worker-comfyui - {error_msg}")
             upload_errors.append(error_msg)
         except Exception as e:

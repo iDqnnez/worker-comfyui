@@ -4,10 +4,11 @@ import sys
 import os
 import json
 import base64
+import requests
 
-# Make sure that "src" is known and can be used to import handler.py
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "src")))
-from src import handler
+# handler.py lives at repository root
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+import handler  # noqa: E402
 
 # Local folder for test resources
 RUNPOD_WORKER_COMFY_TEST_RESOURCES_IMAGES = "./test_resources/images"
@@ -18,19 +19,35 @@ class TestRunpodWorkerComfy(unittest.TestCase):
         input_data = {"workflow": {"key": "value"}}
         validated_data, error = handler.validate_input(input_data)
         self.assertIsNone(error)
-        self.assertEqual(validated_data, {"workflow": {"key": "value"}, "images": None})
+        self.assertEqual(
+            validated_data,
+            {
+                "workflow": {"key": "value"},
+                "images": None,
+                "comfy_org_api_key": None,
+            },
+        )
 
     def test_valid_input_with_workflow_and_images(self):
         input_data = {
             "workflow": {"key": "value"},
-            "images": [{"name": "image1.png", "image": "base64string"}],
+            "images": [
+                {"name": "image1.png", "image": "https://example.com/signed/image1.png"}
+            ],
         }
         validated_data, error = handler.validate_input(input_data)
         self.assertIsNone(error)
-        self.assertEqual(validated_data, input_data)
+        self.assertEqual(
+            validated_data,
+            {**input_data, "comfy_org_api_key": None},
+        )
 
     def test_input_missing_workflow(self):
-        input_data = {"images": [{"name": "image1.png", "image": "base64string"}]}
+        input_data = {
+            "images": [
+                {"name": "image1.png", "image": "https://example.com/signed/image1.png"}
+            ]
+        }
         validated_data, error = handler.validate_input(input_data)
         self.assertIsNotNone(error)
         self.assertEqual(error, "Missing 'workflow' parameter")
@@ -46,6 +63,15 @@ class TestRunpodWorkerComfy(unittest.TestCase):
             error, "'images' must be a list of objects with 'name' and 'image' keys"
         )
 
+    def test_input_with_non_url_image(self):
+        input_data = {
+            "workflow": {"key": "value"},
+            "images": [{"name": "image1.png", "image": "base64string"}],
+        }
+        validated_data, error = handler.validate_input(input_data)
+        self.assertIsNotNone(error)
+        self.assertIn("http(s) URL", error)
+
     def test_invalid_json_string_input(self):
         input_data = "invalid json"
         validated_data, error = handler.validate_input(input_data)
@@ -56,7 +82,14 @@ class TestRunpodWorkerComfy(unittest.TestCase):
         input_data = '{"workflow": {"key": "value"}}'
         validated_data, error = handler.validate_input(input_data)
         self.assertIsNone(error)
-        self.assertEqual(validated_data, {"workflow": {"key": "value"}, "images": None})
+        self.assertEqual(
+            validated_data,
+            {
+                "workflow": {"key": "value"},
+                "images": None,
+                "comfy_org_api_key": None,
+            },
+        )
 
     def test_empty_input(self):
         input_data = None
@@ -206,31 +239,49 @@ class TestRunpodWorkerComfy(unittest.TestCase):
         self.assertEqual(result["status"], "success")
 
     @patch("handler.requests.post")
-    def test_upload_images_successful(self, mock_post):
-        mock_response = unittest.mock.Mock()
-        mock_response.status_code = 200
-        mock_response.text = "Successfully uploaded"
-        mock_post.return_value = mock_response
+    @patch("handler.requests.get")
+    def test_upload_images_successful(self, mock_get, mock_post):
+        mock_download = unittest.mock.Mock()
+        mock_download.raise_for_status = unittest.mock.Mock()
+        mock_download.content = b"Test Image Data"
+        mock_download.headers = {"Content-Type": "image/png"}
+        mock_get.return_value = mock_download
 
-        test_image_data = base64.b64encode(b"Test Image Data").decode("utf-8")
+        mock_post_resp = unittest.mock.Mock()
+        mock_post_resp.status_code = 200
+        mock_post_resp.text = "Successfully uploaded"
+        mock_post.return_value = mock_post_resp
 
-        images = [{"name": "test_image.png", "image": test_image_data}]
+        images = [
+            {"name": "test_image.png", "image": "https://example.com/signed/blob"}
+        ]
 
         responses = handler.upload_images(images)
 
         self.assertEqual(len(responses), 3)
         self.assertEqual(responses["status"], "success")
+        mock_get.assert_called_once()
 
     @patch("handler.requests.post")
-    def test_upload_images_failed(self, mock_post):
-        mock_response = unittest.mock.Mock()
-        mock_response.status_code = 400
-        mock_response.text = "Error uploading"
-        mock_post.return_value = mock_response
+    @patch("handler.requests.get")
+    def test_upload_images_failed(self, mock_get, mock_post):
+        mock_download = unittest.mock.Mock()
+        mock_download.raise_for_status = unittest.mock.Mock()
+        mock_download.content = b"Test Image Data"
+        mock_download.headers = {}
+        mock_get.return_value = mock_download
 
-        test_image_data = base64.b64encode(b"Test Image Data").decode("utf-8")
+        mock_post_resp = unittest.mock.Mock()
+        mock_post_resp.status_code = 400
+        mock_post_resp.text = "Error uploading"
+        mock_post_resp.raise_for_status.side_effect = requests.HTTPError(
+            response=mock_post_resp
+        )
+        mock_post.return_value = mock_post_resp
 
-        images = [{"name": "test_image.png", "image": test_image_data}]
+        images = [
+            {"name": "test_image.png", "image": "https://example.com/signed/blob"}
+        ]
 
         responses = handler.upload_images(images)
 
