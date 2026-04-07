@@ -59,7 +59,8 @@ RUN if [ -n "${CUDA_VERSION_FOR_COMFY}" ]; then \
 
 # Upgrade PyTorch if needed (for newer CUDA versions)
 RUN if [ "$ENABLE_PYTORCH_UPGRADE" = "true" ]; then \
-      uv pip install --force-reinstall torch torchvision torchaudio --index-url ${PYTORCH_INDEX_URL}; \
+      /comfyui/.venv/bin/pip install --upgrade --force-reinstall torch torchvision torchaudio --index-url ${PYTORCH_INDEX_URL}; \
+      /comfyui/.venv/bin/python -c "import torch; print('Comfy runtime torch:', torch.__version__, 'cuda:', torch.version.cuda)"; \
     fi
 
 # Change working directory to ComfyUI
